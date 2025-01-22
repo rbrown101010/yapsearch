@@ -4,6 +4,8 @@ import { useState, useRef } from 'react';
 import ReactMarkdown from 'react-markdown';
 import { motion, AnimatePresence } from 'framer-motion';
 import remarkGfm from 'remark-gfm';
+import MermaidDiagram from '../components/MermaidDiagram';
+import { convertReasoningToMermaid } from '../utils/reasoningToMermaid';
 
 interface Message {
   role: 'user' | 'assistant';
@@ -39,11 +41,15 @@ interface ChatSection {
   query: string;
   searchResults: SearchResult[];
   reasoning: string;
+  mermaidDiagram?: string;
   response: string;
   error?: string | null;
   isLoadingSources?: boolean;
   isLoadingThinking?: boolean;
+  isLoadingDiagram?: boolean;
   isReasoningCollapsed?: boolean;
+  activeTab?: 'text' | 'map';
+  showDiagramModal?: boolean;
 }
 
 interface SuggestionType {
@@ -58,6 +64,88 @@ const TopBar = () => {
       <h1 className="text-2xl font-serif text-gray-900 tracking-tight">YapSearch</h1>
     </div>
   );
+};
+
+// Update the createConciseReasoning function to create Mermaid format
+const createMermaidDiagram = async (reasoning: string) => {
+  try {
+    const response = await fetch('/api/chat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        messages: [
+          {
+            role: 'user',
+            content: `Convert this reasoning process into a Mermaid flowchart diagram. Follow these rules strictly:
+
+1. Output ONLY the Mermaid code, no explanations or markdown
+2. Start with exactly "graph TD"
+3. Each node should be wrapped in square brackets and split into multiple lines:
+   - Add <br> every 3-4 words to create line breaks
+   - Maximum 4 words per line
+   - Maximum 5 lines per node
+4. Use simple arrows "-->"
+5. Use letters A-Z for node IDs
+6. Focus on key decision points and main steps
+7. Include 20 nodes maximum
+8. Format example:
+graph TD
+  A[First Key Point<br>With More Details] --> B[Second Important<br>Decision Point Here]
+  B --> C[Third Step Shows<br>The Final Process]
+
+Here's the reasoning to convert:
+
+${reasoning}`
+          }
+        ]
+      })
+    });
+
+    if (!response.ok) {
+      throw new Error('Failed to generate Mermaid diagram');
+    }
+
+    let mermaidCode = '';
+    const reader = response.body?.getReader();
+    if (!reader) throw new Error('No reader available');
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      const chunk = new TextDecoder().decode(value);
+      const lines = chunk.split('\n').filter(line => line.trim());
+
+      for (const line of lines) {
+        try {
+          const parsed = JSON.parse(line);
+          if (parsed.choices?.[0]?.delta?.content) {
+            mermaidCode += parsed.choices[0].delta.content;
+          }
+        } catch (e) {
+          console.error('Error parsing chunk:', e);
+        }
+      }
+    }
+
+    // Clean up the code
+    mermaidCode = mermaidCode
+      .replace(/```mermaid\n?/g, '')
+      .replace(/```\n?/g, '')
+      .replace(/^\s*[\r\n]/gm, '')
+      .trim();
+
+    // Ensure it starts with graph TD
+    if (!mermaidCode.startsWith('graph TD')) {
+      mermaidCode = 'graph TD\n' + mermaidCode;
+    }
+
+    console.log('Final Mermaid code:', mermaidCode);
+    return mermaidCode;
+  } catch (error) {
+    console.error('Error creating Mermaid diagram:', error);
+    return null;
+  }
 };
 
 export default function Home() {
@@ -219,7 +307,18 @@ export default function Home() {
 
       while (true) {
         const { done, value } = await reader.read();
-        if (done) break;
+        if (done) {
+          // Update the section with search results
+          setChatSections(prev => {
+            const updated = [...prev];
+            updated[sectionIndex] = {
+              ...updated[sectionIndex],
+              searchResults: resultsWithImages
+            };
+            return updated;
+          });
+          break;
+        }
 
         const chunk = new TextDecoder().decode(value);
         const lines = chunk.split('\n').filter(line => line.trim());
@@ -231,16 +330,46 @@ export default function Home() {
               const newReasoning = (assistantMessage.reasoning || '') + parsed.choices[0].delta.reasoning_content;
               assistantMessage.reasoning = newReasoning;
               setCurrentReasoning(newReasoning);
+              
               setChatSections(prev => {
                 const updated = [...prev];
-                updated[sectionIndex] = {
-                  ...updated[sectionIndex],
-                  reasoning: newReasoning,
-                  isLoadingThinking: false
-                };
+                if (updated[sectionIndex]) {
+                  updated[sectionIndex] = {
+                    ...updated[sectionIndex],
+                    reasoning: newReasoning,
+                    isLoadingThinking: false
+                  };
+                }
                 return updated;
               });
             } else if (parsed.choices?.[0]?.delta?.content) {
+              // If this is the first content delta, generate the Mermaid diagram
+              if (!assistantMessage.content && assistantMessage.reasoning && typeof assistantMessage.reasoning === 'string') {
+                // Generate Mermaid diagram as soon as we start getting content
+                (async () => {
+                  try {
+                    console.log('Generating Mermaid diagram for:', assistantMessage.reasoning);
+                    const mermaidCode = await createMermaidDiagram(assistantMessage.reasoning);
+                    if (mermaidCode) {
+                      console.log('Generated Mermaid code:', mermaidCode);
+                      setChatSections(prev => {
+                        const updated = [...prev];
+                        if (updated[sectionIndex]) {
+                          updated[sectionIndex] = {
+                            ...updated[sectionIndex],
+                            mermaidDiagram: mermaidCode,
+                            activeTab: 'map'
+                          };
+                        }
+                        return updated;
+                      });
+                    }
+                  } catch (error) {
+                    console.error('Error generating Mermaid diagram:', error);
+                  }
+                })();
+              }
+
               const newContent = (assistantMessage.content || '') + parsed.choices[0].delta.content;
               assistantMessage.content = newContent;
               setChatSections(prev => {
@@ -533,55 +662,146 @@ export default function Home() {
 
                     {/* Thinking Process */}
                     {section.reasoning && (
-                      <div className="mb-12">
+                      <div className="bg-gray-50 p-4 rounded-lg mb-4">
                         <div className="flex justify-between items-center mb-4">
-                          <div className="flex items-center gap-2">
-                            <svg className="w-5 h-5 text-gray-600" viewBox="0 0 24 24" fill="none" stroke="currentColor">
-                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9.663 17h4.673M12 3v1m6.364 1.636l-.707.707M21 12h-1M4 12H3m3.343-5.657l-.707-.707m2.828 9.9a5 5 0 117.072 0l-.548.547A3.374 3.374 0 0014 18.469V19a2 2 0 11-4 0v-.531c0-.895-.356-1.754-.988-2.386l-.548-.547z" />
-                            </svg>
-                            <h3 className="text-sm font-semibold text-gray-600">Thinking Process:</h3>
-                          </div>
-                          <div className="flex items-center gap-2">
-                            <button
-                              onClick={() => {
-                                setSelectedMessageData({ reasoning: messages[messages.length - 1]?.reasoningInput });
-                                setShowReasoningModal(true);
-                              }}
-                              className="text-xs text-blue-600 hover:text-blue-700 flex items-center gap-1"
-                            >
-                              <span>View Full Input</span>
-                              <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 7l5 5m0 0l-5 5m5-5H6" />
-                              </svg>
-                            </button>
-                            <button
-                              onClick={() => toggleReasoning(index)}
-                              className="text-gray-600 hover:text-gray-700"
-                            >
-                              <svg 
-                                className={`w-5 h-5 transform transition-transform ${section.isReasoningCollapsed ? '-rotate-90' : 'rotate-0'}`} 
-                                fill="none" 
-                                stroke="currentColor" 
-                                viewBox="0 0 24 24"
+                          <div className="flex items-center gap-4">
+                            <h3 className="text-sm font-medium text-gray-900">Reasoning Process</h3>
+                            <div className="flex rounded-lg bg-gray-200 p-1">
+                              <button
+                                onClick={() => setChatSections(prev => {
+                                  const updated = [...prev];
+                                  if (updated[index]) {
+                                    updated[index] = {
+                                      ...updated[index],
+                                      activeTab: 'text'
+                                    };
+                                  }
+                                  return updated;
+                                })}
+                                className={`px-3 py-1 text-sm rounded-md transition-colors ${
+                                  (!section.activeTab || section.activeTab === 'text') 
+                                    ? 'bg-white shadow text-gray-900' 
+                                    : 'text-gray-600 hover:text-gray-900'
+                                }`}
                               >
-                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
-                              </svg>
-                            </button>
+                                Text
+                              </button>
+                              <button
+                                onClick={() => setChatSections(prev => {
+                                  const updated = [...prev];
+                                  if (updated[index]) {
+                                    updated[index] = {
+                                      ...updated[index],
+                                      activeTab: 'map'
+                                    };
+                                  }
+                                  return updated;
+                                })}
+                                className={`px-3 py-1 text-sm rounded-md transition-colors ${
+                                  section.activeTab === 'map'
+                                    ? 'bg-white shadow text-gray-900'
+                                    : 'text-gray-600 hover:text-gray-900'
+                                }`}
+                              >
+                                Thought Map
+                              </button>
+                            </div>
                           </div>
+                          <button
+                            onClick={() => toggleReasoning(index)}
+                            className="text-sm text-gray-500 hover:text-gray-700"
+                          >
+                            {section.isReasoningCollapsed ? 'Show' : 'Hide'}
+                          </button>
                         </div>
-                        <motion.div 
-                          className="pl-4 border-l-2 border-gray-300"
-                          initial={false}
-                          animate={{ 
-                            height: section.isReasoningCollapsed ? 0 : 'auto',
-                            opacity: section.isReasoningCollapsed ? 0 : 1
-                          }}
-                          transition={{ duration: 0.3 }}
-                        >
-                          <div className="text-sm text-gray-600 leading-relaxed overflow-hidden">
-                            {section.reasoning}
-                          </div>
-                        </motion.div>
+                        {!section.isReasoningCollapsed && (
+                          <>
+                            {(!section.activeTab || section.activeTab === 'text') && (
+                              <div className="prose prose-sm max-w-none text-gray-600 mb-4">
+                                <ReactMarkdown
+                                  remarkPlugins={[remarkGfm]}
+                                  components={{
+                                    table: ({ node, ...props }) => (
+                                      <div className="my-4 overflow-x-auto rounded-lg border border-gray-200">
+                                        <table className="w-full text-left border-collapse" {...props} />
+                                      </div>
+                                    ),
+                                    thead: ({ node, ...props }) => (
+                                      <thead className="bg-gray-50" {...props} />
+                                    ),
+                                    tbody: ({ node, ...props }) => (
+                                      <tbody className="bg-white divide-y divide-gray-200" {...props} />
+                                    ),
+                                    tr: ({ node, ...props }) => (
+                                      <tr className="hover:bg-gray-50 transition-colors" {...props} />
+                                    ),
+                                    th: ({ node, ...props }) => (
+                                      <th className="py-2 px-4 text-sm font-medium text-gray-900" {...props} />
+                                    ),
+                                    td: ({ node, ...props }) => (
+                                      <td className="py-2 px-4 text-sm text-gray-500" {...props} />
+                                    )
+                                  }}
+                                >
+                                  {section.reasoning}
+                                </ReactMarkdown>
+                              </div>
+                            )}
+                            
+                            {section.activeTab === 'map' && section.mermaidDiagram && (
+                              <div className="mt-4">
+                                <div 
+                                  onClick={() => setChatSections(prev => {
+                                    const updated = [...prev];
+                                    if (updated[index]) {
+                                      updated[index] = {
+                                        ...updated[index],
+                                        showDiagramModal: true
+                                      };
+                                    }
+                                    return updated;
+                                  })}
+                                  className="cursor-pointer hover:opacity-90 transition-opacity"
+                                >
+                                  <MermaidDiagram content={section.mermaidDiagram} />
+                                </div>
+                              </div>
+                            )}
+
+                            {/* Mermaid Diagram Modal */}
+                            {section.showDiagramModal && section.mermaidDiagram && (
+                              <div className="fixed inset-0 bg-black/50 flex items-center justify-center p-4 z-50">
+                                <div className="bg-white rounded-lg p-8 max-w-[95vw] max-h-[95vh] w-full h-full flex flex-col">
+                                  <div className="flex justify-between items-center mb-4">
+                                    <h3 className="text-lg font-semibold text-gray-900">Thought Map</h3>
+                                    <button
+                                      onClick={() => setChatSections(prev => {
+                                        const updated = [...prev];
+                                        if (updated[index]) {
+                                          updated[index] = {
+                                            ...updated[index],
+                                            showDiagramModal: false
+                                          };
+                                        }
+                                        return updated;
+                                      })}
+                                      className="text-gray-500 hover:text-gray-700"
+                                    >
+                                      <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                                      </svg>
+                                    </button>
+                                  </div>
+                                  <div className="flex-1 flex items-center justify-center overflow-auto">
+                                    <div className="transform scale-[6] origin-center">
+                                      <MermaidDiagram content={section.mermaidDiagram} />
+                                    </div>
+                                  </div>
+                                </div>
+                              </div>
+                            )}
+                          </>
+                        )}
                       </div>
                     )}
 
